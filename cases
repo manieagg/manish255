@@ -1,0 +1,605 @@
+/*------------------------------------------------------------
+Author:      Mac Domingo
+Company:     Deloitte
+Description: Domain Layer for Case object
+
+History
+10/01/2018	    mdomingo   Created
+04/03/2019      cribarra   Edited
+-------------------------------------------------------------------------------------------*/
+public without sharing class Cases extends fflib_SObjectDomain {
+    public class CasesDomainException extends Exception {}
+    public String userProfileName = Utils.getUserProfileName(UserInfo.getProfileId()); 
+	public Id claimActivityRecordTypeId = Utils.getRecordTypeId(AppConstants.OBJECT_CASE, AppConstants.CASE_RECORDTYPE_CLAIM_ACTIVITY);
+	public List<CRM_Original_and_Callback_Queue__mdt> allQueuesAndCallbacks = new CallbackQueueMetadataSelector().selectAllQueues();
+	/**
+	 * Constructor factory bits and bobs
+	 */
+	public Cases(list<Case> records)
+	{
+		super(records);
+	}
+	
+	/**
+	 * Automagically applied onBeforeInsert calls
+	 */
+	public override void onApplyDefaults()
+	{
+        /**
+      * @description Sets the default value of Guidewire Deep Link URLS
+      * * @see CRM-768
+      * @param caseRecords list of case records
+      * @history jdelmundo 05/10/2018 Created
+      */
+        CaseService.populateGuidewireDeepLinks(records);
+	}
+	
+	/**
+	 * Validation process apply general validation to be performed during insert or update,
+	 * called by the handleAfterInsert and handleAfterUpdate methods
+	 */
+	public override void onValidate()
+	{
+
+	}
+
+	/**
+	 * Validation to be performed during insert, called by the handleAfterUpdate method
+	 */
+	public override void onValidate(Map<Id,SObject> existingrecords)
+	{
+
+	}
+	
+	/**
+	 * Perform processing during the before insert phase, this is called by the handleBeforeInsert method
+	 */
+	public override void onBeforeInsert()
+	{
+		//Set of Queue Id if Case is owned by a Queue
+		Set<Id> queueIdSet = new Set<Id>();
+		//Map of Case Record and Case Owned by Queue
+		Map<Id,Case> caseRecordOnQueueMap = new Map<Id,Case>();
+		//Map of Cases that will be under Hold Queue Ownership
+		Map<Id,Case> caseRecordForHoldQueueMap = new Map<Id,Case>();
+		//Set of Case Account Ids
+		Set<Id> caseAccountIds = new Set<Id>();
+        //fetch current date                
+        Datetime todaysDate = DateTime.now();
+        //List of related claims Ids
+        Set<Id> claimIdsList = new Set<Id>();
+        //Map of related Claim records
+        Map<Id, Claim__c> claimsMap = new Map<Id, Claim__c>();
+        //Map of Claim Owners Names
+        Map<Id, String> claimOwnerNamesMap = new Map<Id, String>();
+
+        //Store Queue Owner Id for Queue query
+        for(Case record : (List<Case>)records)
+        {   
+			//GET THE CASE ACCOUNT ID
+            caseAccountIds.add(record.AccountId);
+			if(record.recordTypeId == claimActivityRecordTypeId){
+				claimIdsList.add(record.Claim__c);            
+			}
+			if(string.valueOf(record.OwnerId).startsWith(AppConstants.GROUPID_PREFIX))
+            {
+                queueIdSet.add(record.OwnerId);
+                caseRecordOnQueueMap.put(record.OwnerId,record);
+            }
+        }
+
+        if(!claimIdsList.isEmpty()){
+            //get claim records
+            claimsMap = new ClaimsSelector().selectByIdsReturnClaimsMap(claimIdsList);
+
+            //get claim owner names
+            claimOwnerNamesMap = CaseService.getClaimOwnerNamesMap(claimsMap);
+        }
+
+        //added as hotfix for DEFECT - 9555 31/01/2019
+        //Query for the details of Callback Hold Queue
+        Group callbackHoldQueue = new GroupsSelector().selectHoldQueueByDevName(AppConstants.GROUP_Callback_Hold_Queue);
+        
+        //Query for the details of Hold Queue
+        Group holdQueueRecord = new GroupsSelector().selectHoldQueueByDevName(AppConstants.GROUP_HOLD_QUEUE);
+        //Query for queue based on Queue Id on Case Owner
+        List<Group> queueRecordList = new GroupsSelector().selectGroupBySetId(queueIdSet);
+        
+        Map<String,String> allQueuesAndCallbackMap = CaseService.allQueuesAndCallbackMap;
+        
+        //START - Changes for PIT7-577
+        //Query for Closed Omni Queue Changes
+        Group closedQueueRecord = new GroupsSelector().selectQueueByDevName(AppConstants.GROUP_CLOSED_OMNI);
+        //Get all listed Omni-Channel Queues from Settings
+        Map<Id,Group> omniQueuesMap = getOmniQueuesMap();
+        System.debug('>>>>>> omniQueuesMap: ' + omniQueuesMap);
+        //END - Changes for PIT7-577
+        //Map to change current owner under SME, Corporate and Triage Queue to Hold Queue
+        for(Group groupList : queueRecordList)
+        {
+            if(allQueuesAndCallbackMap.containskey(groupList.DeveloperName))
+            {
+                caseRecordForHoldQueueMap.put(groupList.Id, caseRecordOnQueueMap.get(groupList.Id));
+            }
+        }
+        
+        //record value of Owner Id if under SME, Corporate and Triage Queue on Previous Queue
+        //and replace Owner Id to Hold Queue for batch processing
+        for(Case record : (List<Case>)records)
+        {   
+            system.debug('\n\n\n record :'+record +'\n\n\n');
+            record.Original_Queue__c = record.OwnerId;
+            record.Previous_Owner__c = record.OwnerId;
+
+            //get claim owner name
+            String claimOwnerName = '';
+            if(record.Claim__c != null){
+                claimOwnerName = claimOwnerNamesMap.get(record.Claim__c);
+            }            
+            Boolean isClaimOwnerEmpower = false;
+
+            //check if owner is empower
+            if(claimOwnerName != null){
+                if(claimOwnerName.containsIgnoreCase(AppConstants.EMPOWER_GUIDE_CLAIM_OWNER)
+                    || claimOwnerName.containsIgnoreCase('Triage Specialist Queue')){
+                        isClaimOwnerEmpower = true;
+                }
+            }
+
+            //added as hotfix for DEFECT - 9555 31/01/2019
+            if (record.Status != AppConstants.CLOSED && record.Activity_Pattern_Code__c == AppConstants.CALLBACK_ACTIVITY_PATTERN_CODE)
+            {
+                //record.Original_Queue__c = record.OwnerId;
+                //record.Previous_Owner__c = record.OwnerId;
+                if(record.Call_Date__c != null && record.Call_Range__c != null && isClaimOwnerEmpower)
+                {
+                    record.OwnerId = callbackHoldQueue.Id;
+                    record.Case_Driver__c = False;
+                }
+                //Emp_Guide_Sm_Med_Employer_1_Callback_Q ID will be default value coming from Claim Center for 10373 hotfix
+            }            
+            else if(caseRecordForHoldQueueMap.containsKey(record.OwnerId)
+                  && isClaimOwnerEmpower)
+            {                          
+                //record.Previous_Owner__c = record.OwnerId;
+                //record.Original_Queue__c = record.OwnerId;
+		 if(record.Due_Date__c > todaysDate.date() &&(record.Status != AppConstants.CLOSED)) //PIT7-577 added Closed Status condition
+                {
+                    record.OwnerId = holdQueueRecord.Id;
+                } 
+               //START - Changes for PIT7-577
+            	else if(record.Status == AppConstants.CLOSED 
+                && checkIfCaseShouldGoToNonOmniQueue(record, omniQueuesMap)){
+                record.OwnerId = closedQueueRecord.Id; 
+            }
+            //END - Changes for PIT7-577 
+            }
+
+        }
+
+		if(caseAccountIds.size() > 0){
+            CaseService.assignSubsidiaryAccountRelatedToTheCase(records, caseAccountIds);
+        }
+
+    }
+    /**
+     * Perform processing during the before update phase, this is called by the handleBeforeUpdate method
+     */
+    public override void onBeforeUpdate(Map<Id,SObject> existingRecords)
+    {   
+		Claim_Activity_Setting__mdt claimActivitySettingsValues = new ClaimActivitySettingsSelector().selectByMasterLabel('Custom_Activity_Setting');
+        //Set of Queue Id if Case is owned by a Queue
+        Set<Id> queueIdSet = new Set<Id>();
+        //Map of Case Record and Case Owned by Queue
+        Map<Id,Case> caseRecordOnQueueMap = new Map<Id,Case>();
+        //Map of Cases to have their Original Queue updated
+        Map<Id,Case> caseRecordForOriginalQueueMap = new Map<Id,Case>();
+		//SET OF Case Account Ids
+       	Set<Id> accountIds = new Set<Id>();
+        Datetime todaysDate = DateTime.now();
+        //list of related claims Ids
+        Set<Id> claimIdsList = new Set<Id>();
+        //Map of Claim records
+        Map<Id, Claim__c> claimsMap = new Map<Id, Claim__c>();
+        //Map of Claim Owners Names
+        Map<Id, String> claimOwnerNamesMap = new Map<Id, String>();   
+
+	//List<Profile> loggedProfile = [SELECT Id, Name FROM Profile WHERE Id=:userinfo.getProfileId() LIMIT 1];
+        //String loggedProfileName = loggedProfile[0].Name; 
+	
+        //Store Queue Owner Id for Queue query
+        for(Case record : (List<Case>)records)
+        {
+			Case existingCaseRecord = (Case) existingRecords.get(record.Id);
+            if(existingCaseRecord.AccountId != record.AccountId){
+                accountIds.add(record.AccountId);
+            }
+            if(string.valueOf(record.OwnerId).startsWith(AppConstants.GROUPID_PREFIX))
+            {
+                queueIdSet.add(record.OwnerId);
+                caseRecordOnQueueMap.put(record.OwnerId,record);
+            }
+			if(record.recordTypeId == claimActivityRecordTypeId){
+				claimIdsList.add(record.Claim__c);
+			}
+		}
+
+        if(!claimIdsList.isEmpty()){
+            //get claim records
+            claimsMap = new ClaimsSelector().selectByIdsReturnClaimsMap(claimIdsList);
+
+            //get claim owner names
+            claimOwnerNamesMap = CaseService.getClaimOwnerNamesMap(claimsMap);
+        }
+
+        //added as hotfix for DEFECT - 9555 31/01/2019
+        //Query for the details of Callback Hold Queue
+        Group callbackHoldQueue = new GroupsSelector().selectHoldQueueByDevName(AppConstants.GROUP_Callback_Hold_Queue);
+        //Query for Non CRM Queue
+        Group nonCRMRecord = new GroupsSelector().selectNonCRMQueue(AppConstants.GROUP_NONCRM);
+        //Query for the details of Hold Queue
+        Group holdQueueRecord = new GroupsSelector().selectHoldQueueByDevName(AppConstants.GROUP_HOLD_QUEUE);
+        //Query for Callback Queue Details
+        Group callbackQueueRecord = new GroupsSelector().selectQueueByDevName(AppConstants.GROUP_CALLBACK_QUEUE);
+		//Query for Locking Queue
+        Group lockingQueueRecord = new GroupsSelector().selectLockingQueue(AppConstants.GROUP_LOCKING_QUEUE);
+        //Query for queue based on Queue Id on Case Owner
+        List<Group> queueRecordList = new GroupsSelector().selectGroupBySetId(queueIdSet);
+
+        Map<String,String> allQueuesAndCallbackMap = CaseService.allQueuesAndCallbackMap;
+        
+        //START - Changes for PIT7-577
+        //Query for Closed Omni Queue Changes
+        Group closedQueueRecord = new GroupsSelector().selectQueueByDevName(AppConstants.GROUP_CLOSED_OMNI);
+        //Get all listed Omni-Channel Queues from Settings
+        Map<Id,Group> omniQueuesMap = getOmniQueuesMap();
+        System.debug('>>>>>> omniQueuesMap: ' + omniQueuesMap);
+        //END - Changes for PIT7-577
+        //Map to change current owner under SME, Corporate and Triage Queue to Hold Queue
+        for(Group groupList : queueRecordList)
+        {
+            if(allQueuesAndCallbackMap.containskey(groupList.DeveloperName))
+            {
+                caseRecordForOriginalQueueMap.put(groupList.Id, caseRecordOnQueueMap.get(groupList.Id));
+            }
+        }
+        
+        //Assign value of Owner Id if under Queue to Previous Queue
+        //but don't update Previous Queue if Owner was updated to Hold Queue
+        for(Case record : (List<Case>)records)
+        {   
+            //get claim owner name
+            String claimOwnerName = '';
+            if(record.Claim__c != null){
+                claimOwnerName = claimOwnerNamesMap.get(record.Claim__c);
+            }            
+            Boolean isClaimOwnerEmpower = false;
+
+            //check if owner is empower
+            if(claimOwnerName != null){
+                if(claimOwnerName.containsIgnoreCase(AppConstants.EMPOWER_GUIDE_CLAIM_OWNER)
+                    || claimOwnerName.containsIgnoreCase('Triage Specialist Queue')){
+                        isClaimOwnerEmpower = true;
+                }
+            }
+
+            //added as hotfix for DEFECT - 9555 31/01/2019
+            if (record.Status != AppConstants.CLOSED && record.Activity_Pattern_Code__c == AppConstants.CALLBACK_ACTIVITY_PATTERN_CODE &&
+                userProfileName == AppConstants.INTEGRATION_USER)
+            {
+                if(record.Call_Date__c != null && record.Call_Range__c != null && isClaimOwnerEmpower)
+                {
+                    //record.Original_Queue__c = record.OwnerId;
+                    record.Previous_Owner__c = record.OwnerId;
+                    record.OwnerId = callbackHoldQueue.Id;
+                    record.Case_Driver__c = False;
+                }
+                //if no value for Call Date and Call Range, we expect Claim Center to tell us the callback queue in the owner Id
+                //to route directly
+            }
+            //Store previous Owner Id
+            else if(string.valueOf(record.OwnerId).startsWith(AppConstants.GROUPID_PREFIX) && 
+                    !(record.OwnerId == holdQueueRecord.Id || record.OwnerId == callbackQueueRecord.Id || record.OwnerId == callbackHoldQueue.Id ||
+                      record.OwnerId == lockingQueueRecord.Id)
+                	)
+            {
+                record.Previous_Owner__c = record.OwnerId;
+
+                //populate Original Queue if null upon create
+                if(String.isEmpty(record.Original_Queue__c))
+                {
+                    if(caseRecordForOriginalQueueMap.containsKey(record.OwnerId))
+                    {
+                        record.Original_Queue__c = record.OwnerId;
+                    }   
+                }
+                
+                if(record.Due_Date__c > todaysDate.date() && record.OwnerId != nonCRMRecord.Id){
+                    record.Original_Queue__c = record.OwnerId;
+					if(isClaimOwnerEmpower){
+                        if(claimActivitySettingsValues != null
+							&& claimActivitySettingsValues.Allow_Reassign_of_Claim_Activity__c
+                            && userProfileName != AppConstants.INTEGRATION_USER){
+                            record.OwnerId = record.OwnerId;
+                        }else{
+                            record.OwnerId = holdQueueRecord.Id;
+                        }                            
+                    } 
+                }
+            
+            }
+           
+            if(userProfileName == AppConstants.INTEGRATION_USER){
+                if(record.Status == AppConstants.CLOSED){
+                    record.Current_Case_Disposition__c = AppConstants.COMPLETED_NO_FURTHER_ACTION;
+                    //START - Changes for PIT7-161
+                    record.Completion_Date__c = date.today(); 
+                    record.Case_Driver__c = False;
+                    //END - Changes for PIT7-161
+                }else if(record.Status != null && 
+                            (String.valueOf(record.Status).equalsIgnoreCase(AppConstants.SKIPPED) 
+                                || String.valueOf(record.Status).equalsIgnoreCase(AppConstants.CASE_SKIPPED))){
+                    record.Status = AppConstants.CLOSED;
+                    record.Current_Case_Disposition__c = AppConstants.SKIPPED;
+                    record.Case_Driver__c = False;
+                }
+            }else{
+                    record.Current_Case_Disposition__c = record.Case_Disposition__c;
+             }
+        
+        Case existingRecord = (Case) existingRecords.get(record.Id);
+            
+            if((Utils.getObjectRecordTypeName(record.RecordTypeId, Case.SObjectType) == AppConstants.CASE_RECORDTYPE_COMPLAINT_DISPUTE) && 
+               String.valueOf(existingRecord.OwnerId).startsWith(AppConstants.USERID_PREFIX) && 
+               record.OwnerId != existingRecord.OwnerId && 
+               String.valueOf(record.OwnerId).startsWith(AppConstants.GROUPID_PREFIX) && 
+               record.Type == AppConstants.COMPLAINT && 
+               !record.Acknowledgement_Email_Sent__c && 
+               existingRecord.Status == AppConstants.OPEN && 
+               //(loggedProfileName == AppConstants.CUSTOMER_SERVICE_CENTRE || loggedProfileName == AppConstants.LOSS_PREVENTION_AND_PRICING)){
+               (userProfileName == AppConstants.CUSTOMER_SERVICE_CENTRE || userProfileName == AppConstants.LOSS_PREVENTION_AND_PRICING)){
+                   
+            record.Status = AppConstants.IN_PROGRESS;
+        }
+
+        //resets the Is_Wrapped_Up__c value to false if case status is not 'Closed'
+        //only do this when status is changed from closed.
+        if(existingRecord.Status == AppConstants.CLOSED
+            && record.Status != AppConstants.CLOSED
+            && record.Is_Wrapped_Up__c){
+            record.Is_Wrapped_Up__c = false;
+        }
+          //START - Changes for PIT7-577
+            if(record.Status == AppConstants.CLOSED 
+                && checkIfCaseShouldGoToNonOmniQueue(record, omniQueuesMap)){
+                record.OwnerId = closedQueueRecord.Id; 
+            }
+            //END - Changes for PIT7-577
+        }
+		if(accountIds.size() > 0){
+            //GET ALL SUBSIDIARY ACCOUNT RELATED TO THE CASE CREATED
+            CaseService.assignSubsidiaryAccountRelatedToTheCase(records, accountIds);
+        }		
+    }
+
+	/**
+	 * Perform processing during the before delete phase, this is called by the handleBeforeDelete method
+	*/
+	public override void onBeforeDelete()
+	{
+		
+	}
+
+	/**
+	 * Perform processing during the after insert phase, this is called by the handleAfterInsert method
+	 **/
+	public override void onAfterInsert()
+	{
+        CaseService.createCaseTeam(records);
+	}
+
+	/**
+	 * Perform processing during the after update phase, this is called by the handleAfterUpdate method
+	 **/
+	public override void onAfterUpdate(Map<Id,SObject> existingRecords)
+	{
+        Map<Id, Case> caseMap = (Map<Id, Case>) existingRecords;
+        CaseService.createCaseTeam(records);
+        CaseService.sendEmailToQueueMembers(records, caseMap);
+	}
+
+	/**
+	 * Perform processing during the after delete phase, this is called by the handleAfterDelete method
+	 **/
+	public override void onAfterDelete()
+	{
+		
+	}
+
+	/**
+	 * Perform processing during the after undelete phase, this is called by the handleAfterDelete method
+	 **/
+	public override void onAfterUndelete()
+	{
+
+	}
+
+	/**
+	 * More constructor factory bits and bobs
+	 */
+	public class Constructor implements fflib_SObjectDomain.IConstructable
+	{
+		public fflib_SObjectDomain construct(List<SObject> sObjectList)
+		{
+			return new Cases(sObjectList);
+		}
+
+		public fflib_SObjectDomain construct(List<SObject> sObjectList, SObjectType sObjectType)
+		{
+			return new Cases(sObjectList);
+		}
+	}
+	
+	/**
+    * Method that creates a map of claim id and the claim owner's name
+    * @param   claimsMap Map of claim id and claim record
+    * @returns Map or claim id and claim owner name in string format
+    */ 
+    public static Map<Id, String> getClaimOwnerNamesMap(Map<Id, Claim__c> claimsMap){
+        Map<Id, String> claimOwnerNamesMap = new Map<Id, String>();
+        Map<Id, User> claimsUserMap = new Map<Id, User>();
+        Map<Id, Group> claimsQueueMap = new Map<Id, Group>(); 
+        Set<Id> claimUsers = new Set<Id>();
+        Set<Id> claimQueues = new Set<Id>();
+        for(Claim__c parentClaim:claimsMap.values()){
+            if(String.valueOf(parentClaim.OwnerId).startsWith(AppConstants.GROUPID_PREFIX)){
+                claimQueues.add(parentClaim.OwnerId);
+            }else{
+                claimUsers.add(parentClaim.OwnerId);
+            }                
+        }
+        if(!claimQueues.isEmpty()){
+            claimsQueueMap = New GroupsSelector().selectbyIdsReturnMap(claimQueues);
+            for(Claim__c claim: claimsMap.values()){
+                if(String.valueOf(claim.OwnerId).startsWith(AppConstants.GROUPID_PREFIX)
+                    && claimsQueueMap.get(claim.OwnerId) != null){
+					claimOwnerNamesMap.put(claim.Id, claimsQueueMap.get(claim.OwnerId).Name);
+				}
+			}
+        }            
+        if(!claimUsers.isEmpty()){
+            claimsUserMap = New UsersSelector().selectbyIdsReturnMap(claimUsers);
+            for(Claim__c claim: claimsMap.values()){
+                if(!String.valueOf(claim.OwnerId).startsWith(AppConstants.GROUPID_PREFIX)
+                    && claimsUserMap.get(claim.OwnerId) != null){
+					if(claimOwnerNamesMap.get(claim.Id) == null || String.isBlank(claimOwnerNamesMap.get(claim.Id))){
+						claimOwnerNamesMap.put(claim.Id, claimsUserMap.get(claim.OwnerId).Name);
+					}
+				}
+            }
+        }
+        return claimOwnerNamesMap;
+    }
+
+    //START - Changes for PIT7-161
+    /**
+    * Method that unlocks related cases for a list of given claim ids
+    * @param    parentClaimsIdSet list of claim ids whose cases needs to be unlocked.
+    * @returns  none
+    */
+    public static void unlockRelatedCases(Set<Id> parentClaimsIdSet){
+            
+        //get claim owner names to be able to check if claims is owned by empower
+         Map<Id, Claim__c> claimsMap = new Map<Id, Claim__c>();
+         Map<Id, String> claimOwnerNamesMap = new Map<Id, String>(); 
+            
+        //get claim records
+        claimsMap = new ClaimsSelector().selectByIdsReturnClaimsMap(parentClaimsIdSet);  
+         
+        //get claim owner names
+        claimOwnerNamesMap = getClaimOwnerNamesMap(claimsMap); 
+ 
+            
+        //get related cases to unlock
+        List<Case> casestoUnlock = new List<Case>();
+            
+         casestoUnlock = getRelatedCasesForUnlocking(parentClaimsIdSet,
+                                        claimOwnerNamesMap,
+                                        claimsMap);
+    
+
+        if(!casestoUnlock.isEmpty()){
+            fflib_SObjectUnitOfWork uow = Application.UnitOfWork.newInstance();
+            uow.registerDirty(casestoUnlock);
+            try{
+                uow.commitWork();
+            }catch(Exception ex){
+                System.debug(' Exception message: ' + ex.getMessage());
+            }
+         }     
+    }
+
+    /**
+    * Method that fetches related cases that needs to be unlocked.
+    * @param    parentClaimsForUnlockingCase Set of claim id whose cases needs to eb unlocked
+                claimOwnerNamesMap Map of claim and their owner name
+                claimsMap Map of claim id and claim record
+    * @returns List of cases to be unlocked
+    */
+    public static List <Case> getRelatedCasesForUnlocking (Set<Id> parentClaimsForUnlockingCase, 
+                                                            Map<Id, String> claimOwnerNamesMap,
+                                                            Map<Id, Claim__c> claimsMap) {
+
+        // List of Cases under the same Parent Claim
+        List <Case> casesToUnlock = new CasesSelector().casesUnderParentClaimQuery(parentClaimsForUnlockingCase);
+  
+        //Query for the details of Locking Queue
+        Group lockingQueue = new GroupsSelector().selectHoldQueueByDevName(AppConstants.GROUP_LOCKING_QUEUE);
+        // List of Cases to be Unlocked
+        List <Case> casesUnlockingList = new List<Case>();
+        for(Case record : casesToUnlock)
+        {
+            if(record.Locking_Previous_Queue__c != null && record.OwnerId == lockingQueue.Id)
+            {
+                String claimOwnerName = claimOwnerNamesMap.get(record.Claim__c);
+                Boolean isClaimOwnerEmpower = false;
+
+                //check if owner is empower
+                if(claimOwnerName != null){
+                    if(claimOwnerName.containsIgnoreCase(AppConstants.EMPOWER_GUIDE_CLAIM_OWNER)
+                        || claimOwnerName.containsIgnoreCase('Triage Specialist Queue')){
+                            isClaimOwnerEmpower = true;
+                    }
+                }
+                //assign case to claim owner if claim owner is not Empower & Guide User/Queue
+                if(!isClaimOwnerEmpower){
+                    record.OwnerId = claimsMap.get(record.Claim__c).OwnerId;
+                }else{
+                    record.OwnerId = record.Locking_Previous_Queue__c;
+                }                                                                	
+                casesUnlockingList.add(record);
+            }
+        }
+        return casesUnlockingList;
+    }
+    //END - Changes for PIT7-161
+
+        //START - Changes for PIT7-577
+    /**
+    * Method that checks if a given case record should be reassigned to a non-Omnichannel Queue.
+    * @param    caseRecord Case record to be checked
+                holdQueueRecordId Id of Hold queue in current environment
+                callbackHoldQueueId Id of Call back Hold queue in current environment
+                mapOwnerAndCase Map of case owner and Empowered case record
+    * @returns Boolean value TRUE if case should be assigned to non-Omnichannel Queue.  
+    */
+    public Boolean checkIfCaseShouldGoToNonOmniQueue(Case caseRecord,                                                             
+                                                     Map<Id,Group> omniQueuesMap){
+        Boolean shouldBeReassigned = false;
+        if(caseRecord != null
+            && omniQueuesMap.containsKey(caseRecord.OwnerId)){
+            shouldBeReassigned = true;
+        }
+        return shouldBeReassigned;
+    }
+
+    public Map<Id,Group> getOmniQueuesMap(){
+        Map<Id,Group> omniQueuesMap = new Map<Id,Group>();
+        List<String> omniQueuesStringList = new List<String>();
+        List<Closed_Activity_Queue_Setting__mdt> omniQueuesList = new OmniQueuesSettingsSelector().selectAllOmniQueues();        
+        
+        for(Closed_Activity_Queue_Setting__mdt omniQueue:omniQueuesList){
+            omniQueuesStringList.add(omniQueue.Queue_Name__c);
+        }
+
+        if(!omniQueuesStringList.isEmpty()){
+            List<Group> OmniQueuesRecordsList = New GroupsSelector().selectQueueByDevNameSet(omniQueuesStringList);
+            for(Group queue:OmniQueuesRecordsList){
+                omniQueuesMap.put(queue.Id, queue);
+            }
+        }
+
+        return omniQueuesMap;
+    }
+    //END - Changes for PIT7-577
+}
